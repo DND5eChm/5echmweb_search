@@ -4,6 +4,16 @@ const path = require("path");
 const cors = require("cors");
 const vm = require("vm");
 
+const MIN_TOKEN_LENGTH = 2;
+const CACHE_MAX_ENTRIES = 120;
+const CACHE_TTL = 5 * 60 * 1000;
+const PREVIEW_MAX_LENGTH = 600;
+const MAX_PAGE_SIZE = 100;
+
+let searchData = [];
+let tokenIndex = new Map();
+const queryCache = new Map();
+
 const app = express();
 const PORT = process.env.PORT ? parseInt(process.env.PORT, 10) : 13000;
 
@@ -13,9 +23,10 @@ app.use(express.json());
 app.use(express.static(__dirname));
 
 // 加载并解析 data.js
-let searchData = [];
 function loadSearchData() {
   try {
+    resetInMemoryStructures();
+
     const dataPath = path.join(__dirname, "data.js");
     const content = fs.readFileSync(dataPath, "utf-8");
 
@@ -32,11 +43,22 @@ function loadSearchData() {
           const rawContent = rawContents[i] || "";
           const rawTitle = rawContents[i + 1] || "";
           const rawPath = rawContents[i + 2] || "";
-          searchData.push({
-            content: normalizeLineEndings(String(rawContent)),
-            title: String(rawTitle),
-            path: String(rawPath).replace(/\\\\/g, "/"),
-          });
+
+          const normalizedContent = normalizeLineEndings(String(rawContent));
+          const normalizedTitle = normalizeLineEndings(String(rawTitle)).trim();
+          const sanitizedPath = String(rawPath).replace(/\\\\/g, "/");
+
+          const record = {
+            content: normalizedContent,
+            title: normalizedTitle,
+            path: sanitizedPath,
+            titleLower: normalizedTitle.toLowerCase(),
+            contentLower: normalizedContent.toLowerCase(),
+          };
+
+          const docIndex = searchData.length;
+          searchData.push(record);
+          indexDocumentTokens(docIndex, record.titleLower, record.contentLower);
         }
       }
     }
@@ -46,6 +68,35 @@ function loadSearchData() {
   }
 }
 
+function resetInMemoryStructures() {
+  searchData = [];
+  tokenIndex = new Map();
+  queryCache.clear();
+}
+
+function indexDocumentTokens(docIndex, titleLower, contentLower) {
+  const tokens = extractTokens(`${titleLower} ${contentLower}`);
+  tokens.forEach((token) => {
+    let bucket = tokenIndex.get(token);
+    if (!bucket) {
+      bucket = new Set();
+      tokenIndex.set(token, bucket);
+    }
+    bucket.add(docIndex);
+  });
+}
+
+function extractTokens(text) {
+  if (!text) {
+    return [];
+  }
+  const pieces = text
+    .split(/[^a-zA-Z0-9\u4e00-\u9fa5]+/)
+    .map((segment) => segment.trim())
+    .filter((segment) => segment.length >= MIN_TOKEN_LENGTH);
+  return [...new Set(pieces)];
+}
+
 function normalizeLineEndings(text) {
   return text
     .replace(/\r\n/g, "\n")
@@ -53,7 +104,24 @@ function normalizeLineEndings(text) {
     .replace(/\r/g, "\n");
 }
 
-function buildPreview(text, keywords, maxLength = 600) {
+function countOccurrences(source, keyword) {
+  if (!source || !keyword) {
+    return 0;
+  }
+  let count = 0;
+  let startIndex = 0;
+  while (true) {
+    const idx = source.indexOf(keyword, startIndex);
+    if (idx === -1) {
+      break;
+    }
+    count += 1;
+    startIndex = idx + keyword.length;
+  }
+  return count;
+}
+
+function buildPreview(text, keywords, maxLength = PREVIEW_MAX_LENGTH) {
   if (!text) return "";
   const normalized = normalizeLineEndings(text);
   const lower = normalized.toLowerCase();
@@ -113,6 +181,101 @@ function buildDisplayTitle(rawTitle, sourcePath) {
   return "未命名页面";
 }
 
+function buildCacheKey(keywordsLower, isTitleOnly, baseIndexesSet) {
+  const basePart = baseIndexesSet
+    ? Array.from(baseIndexesSet).sort((a, b) => a - b).join(",")
+    : "";
+  return `${isTitleOnly ? 1 : 0}|${keywordsLower.join(" ")}|${basePart}`;
+}
+
+function getCachedResults(cacheKey) {
+  const entry = queryCache.get(cacheKey);
+  if (!entry) {
+    return null;
+  }
+  if (Date.now() - entry.timestamp > CACHE_TTL) {
+    queryCache.delete(cacheKey);
+    return null;
+  }
+  queryCache.delete(cacheKey);
+  queryCache.set(cacheKey, entry);
+  return entry.results;
+}
+
+function setCachedResults(cacheKey, results) {
+  queryCache.set(cacheKey, { results, timestamp: Date.now() });
+  if (queryCache.size > CACHE_MAX_ENTRIES) {
+    const oldestKey = queryCache.keys().next().value;
+    if (oldestKey) {
+      queryCache.delete(oldestKey);
+    }
+  }
+}
+
+function collectCandidateIndexes(keywordsLower, baseIndexesSet) {
+  let candidateSet = null;
+  let usedIndexedKeyword = false;
+
+  for (const keyword of keywordsLower) {
+    if (keyword.length < MIN_TOKEN_LENGTH) {
+      continue;
+    }
+    const bucket = tokenIndex.get(keyword);
+    if (!bucket || bucket.size === 0) {
+      continue;
+    }
+    usedIndexedKeyword = true;
+
+    let filteredBucket;
+    if (baseIndexesSet) {
+      filteredBucket = new Set();
+      bucket.forEach((idx) => {
+        if (baseIndexesSet.has(idx)) {
+          filteredBucket.add(idx);
+        }
+      });
+    } else {
+      filteredBucket = new Set(bucket);
+    }
+
+    if (!candidateSet) {
+      candidateSet = filteredBucket;
+    } else {
+      const intersection = new Set();
+      filteredBucket.forEach((idx) => {
+        if (candidateSet.has(idx)) {
+          intersection.add(idx);
+        }
+      });
+      candidateSet = intersection;
+    }
+
+    if (candidateSet.size === 0) {
+      break;
+    }
+  }
+
+  if (!usedIndexedKeyword) {
+    return baseIndexesSet ? new Set(baseIndexesSet) : null;
+  }
+
+  return candidateSet || new Set();
+}
+
+function paginateResults(sortedResults, pageNum, pageSize) {
+  const total = sortedResults.length;
+  const totalPages = Math.ceil(total / pageSize);
+  const start = (pageNum - 1) * pageSize;
+  const paginatedResults = sortedResults.slice(start, start + pageSize);
+  return {
+    results: paginatedResults,
+    total,
+    page: pageNum,
+    totalPages,
+    pageSize,
+  };
+}
+
 // 搜索 API
 app.get("/api/search", (req, res) => {
   const {
@@ -124,7 +287,7 @@ app.get("/api/search", (req, res) => {
   } = req.query;
 
   const pageNum = Math.max(parseInt(page, 10) || 1, 1);
-  const size = Math.max(parseInt(pageSize, 10) || 20, 1);
+  const size = Math.min(Math.max(parseInt(pageSize, 10) || 20, 1), MAX_PAGE_SIZE);
 
   if (!keyword) {
     return res.json({
@@ -158,7 +321,6 @@ app.get("/api/search", (req, res) => {
     }
   }
 
-  // 将关键词分割成多个词
   const keywords = keyword
     .trim()
     .split(/\s+/)
@@ -172,48 +334,77 @@ app.get("/api/search", (req, res) => {
       pageSize: size,
     });
   }
+
+  const keywordsLower = keywords.map((kw) => kw.toLowerCase());
   const isTitleOnly = titleOnly === "true";
 
-  // 搜索并计算相关度
+  const cacheKey = buildCacheKey(keywordsLower, isTitleOnly, baseIndexesSet);
+  const cachedResults = getCachedResults(cacheKey);
+  if (cachedResults) {
+    return res.json(paginateResults(cachedResults, pageNum, size));
+  }
+
+  const candidateSet = collectCandidateIndexes(keywordsLower, baseIndexesSet);
+  if (candidateSet && candidateSet.size === 0) {
+    setCachedResults(cacheKey, []);
+    return res.json(paginateResults([], pageNum, size));
+  }
+
+  let searchSpace;
+  if (candidateSet) {
+    searchSpace = Array.from(candidateSet);
+  } else if (baseIndexesSet) {
+    searchSpace = Array.from(baseIndexesSet);
+  } else {
+    searchSpace = searchData.map((_, idx) => idx);
+  }
+
   const results = [];
 
-  searchData.forEach((item, index) => {
-    if (baseIndexesSet && !baseIndexesSet.has(index)) {
-      return;
+  for (let i = 0; i < searchSpace.length; i += 1) {
+    const index = searchSpace[i];
+    const item = searchData[index];
+    if (!item) {
+      continue;
     }
 
     let titleRank = 1;
     let contentRank = 1;
     let titleHits = 0;
     let contentHits = 0;
+    let matched = false;
 
-    keywords.forEach((kw) => {
-      const regex = new RegExp(kw, "gi");
-
-      const titleMatches = item.title.match(regex);
-      if (titleMatches) {
-        titleHits += titleMatches.length;
-        titleRank *= titleMatches.length + 1;
+    for (let k = 0; k < keywordsLower.length; k += 1) {
+      const kwLower = keywordsLower[k];
+      const titleOccurrences = countOccurrences(item.titleLower, kwLower);
+      if (titleOccurrences > 0) {
+        matched = true;
+        titleHits += titleOccurrences;
+        titleRank *= titleOccurrences + 1;
       }
 
       if (!isTitleOnly) {
-        const contentMatches = item.content.match(regex);
-        if (contentMatches) {
-          contentHits += contentMatches.length;
-          contentRank *= contentMatches.length + 1;
+        const contentOccurrences = countOccurrences(
+          item.contentLower,
+          kwLower
+        );
+        if (contentOccurrences > 0) {
+          matched = true;
+          contentHits += contentOccurrences;
+          contentRank *= contentOccurrences + 1;
         }
       }
-    });
+    }
 
-    if (titleHits === 0 && contentHits === 0) {
-      return;
+    if (!matched) {
+      continue;
     }
 
     const totalRank =
-      Math.round(Math.pow(titleRank, 1 / keywords.length) * 20) +
+      Math.round(Math.pow(titleRank, 1 / keywordsLower.length) * 20) +
       (isTitleOnly
         ? 0
-        : Math.round(Math.pow(contentRank, 1 / keywords.length)));
+        : Math.round(Math.pow(contentRank, 1 / keywordsLower.length)));
 
     const sourcePath = extractSourcePath(item.path);
     const displayTitle = buildDisplayTitle(item.title, sourcePath);
@@ -227,26 +418,20 @@ app.get("/api/search", (req, res) => {
       sourcePath,
       rank: totalRank,
       preview,
-      content: normalizeLineEndings(item.content),
+      content: item.content,
     });
+  }
+
+  results.sort((a, b) => {
+    if (b.rank !== a.rank) {
+      return b.rank - a.rank;
+    }
+    return a.index - b.index;
   });
 
-  // 按相关度排序
-  results.sort((a, b) => b.rank - a.rank);
+  setCachedResults(cacheKey, results);
 
-  // 分页
-  const total = results.length;
-  const totalPages = Math.ceil(total / size);
-  const start = (pageNum - 1) * size;
-  const paginatedResults = results.slice(start, start + size);
-
-  res.json({
-    results: paginatedResults,
-    total,
-    page: pageNum,
-    totalPages,
-    pageSize: size,
-  });
+  res.json(paginateResults(results, pageNum, size));
 });
 
 // 获取内容详情
@@ -254,10 +439,10 @@ app.get("/api/content/:index", (req, res) => {
   const index = parseInt(req.params.index);
 
   if (index >= 0 && index < searchData.length) {
-    res.json(searchData[index]);
-  } else {
-    res.status(404).json({ error: "内容未找到" });
+    const { content, title, path: docPath } = searchData[index];
+    return res.json({ content, title, path: docPath });
   }
+  res.status(404).json({ error: "内容未找到" });
 });
 
 // 启动服务器前加载数据
