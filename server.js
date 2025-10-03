@@ -12,36 +12,81 @@ app.use(cors());
 app.use(express.json());
 app.use(express.static(__dirname));
 
-// 加载并解析 data.js
+// 加载并解析数据文件
 let searchData = [];
-function loadSearchData() {
-    try {
-        const dataPath = path.join(__dirname, 'data.js');
-        const content = fs.readFileSync(dataPath, 'utf-8');
 
+function ingestEntry(rawContent, rawTitle, rawPath) {
+    searchData.push({
+        content: normalizeLineEndings(String(rawContent || '')),
+        title: String(rawTitle || ''),
+        path: String(rawPath || '').replace(/\\+/g, '/').replace(/\\\\/g, '/')
+    });
+}
+
+function loadFromChunks(chunkDir) {
+    try {
+        if (!fs.existsSync(chunkDir)) {
+            return false;
+        }
+        const manifestPath = path.join(chunkDir, 'manifest.json');
+        let chunkFiles = [];
+        if (fs.existsSync(manifestPath)) {
+            const manifest = JSON.parse(fs.readFileSync(manifestPath, 'utf-8'));
+            if (manifest && Array.isArray(manifest.chunks)) {
+                chunkFiles = manifest.chunks;
+            }
+        }
+        if (!chunkFiles.length) {
+            chunkFiles = fs.readdirSync(chunkDir).filter(name => name.endsWith('.json'));
+        }
+        chunkFiles.sort();
+        chunkFiles.forEach(file => {
+            const fullPath = path.join(chunkDir, file);
+            const content = fs.readFileSync(fullPath, 'utf-8');
+            const data = JSON.parse(content);
+            if (Array.isArray(data)) {
+                data.forEach(entry => {
+                    if (Array.isArray(entry)) {
+                        ingestEntry(entry[0], entry[1], entry[2]);
+                    } else if (entry && typeof entry === 'object') {
+                        ingestEntry(entry.content, entry.title, entry.path);
+                    }
+                });
+            }
+        });
+        return searchData.length > 0;
+    } catch (error) {
+        console.error('加载分块数据失败:', error);
+        return false;
+    }
+}
+
+function loadFromLegacy(dataPath) {
+    try {
+        const content = fs.readFileSync(dataPath, 'utf-8');
         const sandbox = {};
         vm.createContext(sandbox);
         const script = new vm.Script(`${content}; contents;`, { filename: 'data.js' });
         const rawContents = script.runInContext(sandbox, { timeout: 5000 });
-
         if (Array.isArray(rawContents)) {
-            for (let i = 0; i < rawContents.length; i += 3) {
-                if (i + 2 < rawContents.length) {
-                    const rawContent = rawContents[i] || '';
-                    const rawTitle = rawContents[i + 1] || '';
-                    const rawPath = rawContents[i + 2] || '';
-                    searchData.push({
-                        content: normalizeLineEndings(String(rawContent)),
-                        title: String(rawTitle),
-                        path: String(rawPath).replace(/\\\\/g, '/')
-                    });
-                }
+            for (let i = 0; i + 2 < rawContents.length; i += 3) {
+                ingestEntry(rawContents[i], rawContents[i + 1], rawContents[i + 2]);
             }
         }
-        console.log(`已加载 ${searchData.length} 条数据`);
     } catch (error) {
-        console.error('加载数据失败:', error);
+        console.error('加载 data.js 失败:', error);
     }
+}
+
+function loadSearchData() {
+    searchData = [];
+    const chunkDir = path.join(__dirname, 'data_chunks');
+    const loadedFromChunks = loadFromChunks(chunkDir);
+    if (!loadedFromChunks) {
+        const dataPath = path.join(__dirname, 'data.js');
+        loadFromLegacy(dataPath);
+    }
+    console.log(`已加载 ${searchData.length} 条数据`);
 }
 
 function normalizeLineEndings(text) {
