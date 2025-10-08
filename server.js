@@ -10,10 +10,12 @@ const CACHE_MAX_ENTRIES = 120;
 const CACHE_TTL = 5 * 60 * 1000;
 const PREVIEW_MAX_LENGTH = 600;
 const MAX_PAGE_SIZE = 100;
+const DEFAULT_CATEGORY = "未分类";
 
 let searchData = [];
 let tokenIndex = new Map();
 const queryCache = new Map();
+let categories = new Set();
 
 const app = express();
 const PORT = process.env.PORT ? parseInt(process.env.PORT, 10) : 13000;
@@ -27,6 +29,7 @@ app.use(express.static(__dirname));
 function loadSearchData() {
   try {
     resetInMemoryStructures();
+    categories.add(DEFAULT_CATEGORY);
 
     const dataPath = path.join(__dirname, "data.js");
     const content = fs.readFileSync(dataPath, "utf-8");
@@ -47,7 +50,8 @@ function loadSearchData() {
 
           const normalizedContent = normalizeLineEndings(String(rawContent));
           const normalizedTitle = normalizeLineEndings(String(rawTitle)).trim();
-          const sanitizedPath = String(rawPath).replace(/\\\\/g, "/");
+          const sanitizedPath = String(rawPath).replace(/\\+/g, "/");
+          const category = extractCategory(sanitizedPath);
 
           const record = {
             content: normalizedContent,
@@ -55,11 +59,13 @@ function loadSearchData() {
             path: sanitizedPath,
             titleLower: normalizedTitle.toLowerCase(),
             contentLower: normalizedContent.toLowerCase(),
+            category,
           };
 
           const docIndex = searchData.length;
           searchData.push(record);
           indexDocumentTokens(docIndex, record.titleLower, record.contentLower);
+          categories.add(category);
         }
       }
     }
@@ -73,6 +79,7 @@ function resetInMemoryStructures() {
   searchData = [];
   tokenIndex = new Map();
   queryCache.clear();
+  categories = new Set();
 }
 
 function indexDocumentTokens(docIndex, titleLower, contentLower) {
@@ -165,6 +172,19 @@ function extractSourcePath(rawPath) {
   return rawPath.replace(/\\+/g, "/").replace(/^topics\//i, "");
 }
 
+function extractCategory(sanitizedPath) {
+  if (!sanitizedPath) {
+    return DEFAULT_CATEGORY;
+  }
+  const normalized = sanitizedPath.replace(/^topics\//i, "").trim();
+  if (!normalized) {
+    return DEFAULT_CATEGORY;
+  }
+  const parts = normalized.split("/");
+  const category = parts[0] ? parts[0].trim() : "";
+  return category || DEFAULT_CATEGORY;
+}
+
 function buildDisplayTitle(rawTitle, sourcePath) {
   if (rawTitle) {
     const normalized = normalizeLineEndings(rawTitle).trim();
@@ -182,11 +202,36 @@ function buildDisplayTitle(rawTitle, sourcePath) {
   return "未命名页面";
 }
 
-function buildCacheKey(keywordsLower, isTitleOnly, baseIndexesSet) {
+function parseSearchKeywords(rawKeyword) {
+  if (!rawKeyword) {
+    return [];
+  }
+  const groups = [];
+  const regex = /"([^"]+)"|(\S+)/g;
+  let match;
+  while ((match = regex.exec(rawKeyword)) !== null) {
+    const token = (match[1] || match[2] || "").trim();
+    if (!token) {
+      continue;
+    }
+    const orParts = token
+      .split("|")
+      .map((part) => part.trim())
+      .filter((part) => part.length > 0);
+    if (orParts.length > 0) {
+      groups.push(orParts);
+    }
+  }
+  return groups;
+}
+
+function buildCacheKey(keywordSignatureParts, isTitleOnly, baseIndexesSet, category) {
   const basePart = baseIndexesSet
     ? Array.from(baseIndexesSet).sort((a, b) => a - b).join(",")
     : "";
-  return `${isTitleOnly ? 1 : 0}|${keywordsLower.join(" ")}|${basePart}`;
+  return `${isTitleOnly ? 1 : 0}|${keywordSignatureParts.join(" ")}|${basePart}|${
+    category || ""
+  }`;
 }
 
 function getCachedResults(cacheKey) {
@@ -213,17 +258,23 @@ function setCachedResults(cacheKey, results) {
   }
 }
 
-function collectCandidateIndexes(keywordsLower, baseIndexesSet) {
+function collectCandidateIndexes(keywordGroupsLower, baseIndexesSet) {
   let candidateSet = null;
   let usedIndexedKeyword = false;
 
-  for (const keyword of keywordsLower) {
-    if (keyword.length < MIN_TOKEN_LENGTH) {
+  for (const group of keywordGroupsLower) {
+    if (!Array.isArray(group) || group.length === 0) {
       continue;
     }
-    if (!ASCII_TOKEN_REGEX.test(keyword)) {
+    const asciiCandidates = group.filter(
+      (keyword) =>
+        keyword.length >= MIN_TOKEN_LENGTH && ASCII_TOKEN_REGEX.test(keyword)
+    );
+    if (asciiCandidates.length !== 1) {
       continue;
     }
+
+    const keyword = asciiCandidates[0];
     const bucket = tokenIndex.get(keyword);
     if (!bucket || bucket.size === 0) {
       continue;
@@ -288,6 +339,7 @@ app.get("/api/search", (req, res) => {
     page = 1,
     pageSize = 20,
     baseIndexes = "",
+    category = "",
   } = req.query;
 
   const pageNum = Math.max(parseInt(page, 10) || 1, 1);
@@ -325,11 +377,9 @@ app.get("/api/search", (req, res) => {
     }
   }
 
-  const keywords = keyword
-    .trim()
-    .split(/\s+/)
-    .filter((k) => k.length > 0);
-  if (keywords.length === 0) {
+  const keywordGroups = parseSearchKeywords(keyword);
+  const previewKeywords = keywordGroups.flat();
+  if (keywordGroups.length === 0) {
     return res.json({
       results: [],
       total: 0,
@@ -339,16 +389,31 @@ app.get("/api/search", (req, res) => {
     });
   }
 
-  const keywordsLower = keywords.map((kw) => kw.toLowerCase());
+  const keywordGroupsLower = keywordGroups.map((group) =>
+    group.map((token) => token.toLowerCase())
+  );
+  const cacheKeyParts = keywordGroupsLower.map((group) => group.join("|"));
   const isTitleOnly = titleOnly === "true";
+  const rawCategory =
+    typeof category === "string" ? category.trim() : "";
+  const categoryFilter =
+    rawCategory && rawCategory.toLowerCase() !== "all" ? rawCategory : "";
 
-  const cacheKey = buildCacheKey(keywordsLower, isTitleOnly, baseIndexesSet);
+  const cacheKey = buildCacheKey(
+    cacheKeyParts,
+    isTitleOnly,
+    baseIndexesSet,
+    categoryFilter
+  );
   const cachedResults = getCachedResults(cacheKey);
   if (cachedResults) {
     return res.json(paginateResults(cachedResults, pageNum, size));
   }
 
-  const candidateSet = collectCandidateIndexes(keywordsLower, baseIndexesSet);
+  const candidateSet = collectCandidateIndexes(
+    keywordGroupsLower,
+    baseIndexesSet
+  );
   if (candidateSet && candidateSet.size === 0) {
     setCachedResults(cacheKey, []);
     return res.json(paginateResults([], pageNum, size));
@@ -363,6 +428,17 @@ app.get("/api/search", (req, res) => {
     searchSpace = searchData.map((_, idx) => idx);
   }
 
+  if (categoryFilter) {
+    searchSpace = searchSpace.filter((idx) => {
+      const doc = searchData[idx];
+      return doc && doc.category === categoryFilter;
+    });
+    if (searchSpace.length === 0) {
+      setCachedResults(cacheKey, []);
+      return res.json(paginateResults([], pageNum, size));
+    }
+  }
+
   const results = [];
 
   for (let i = 0; i < searchSpace.length; i += 1) {
@@ -374,45 +450,66 @@ app.get("/api/search", (req, res) => {
 
     let titleRank = 1;
     let contentRank = 1;
-    let titleHits = 0;
-    let contentHits = 0;
-    let matched = false;
+    let matchedAllKeywords = true;
 
-    for (let k = 0; k < keywordsLower.length; k += 1) {
-      const kwLower = keywordsLower[k];
-      const titleOccurrences = countOccurrences(item.titleLower, kwLower);
-      if (titleOccurrences > 0) {
-        matched = true;
-        titleHits += titleOccurrences;
-        titleRank *= titleOccurrences + 1;
+    for (let g = 0; g < keywordGroupsLower.length; g += 1) {
+      const group = keywordGroupsLower[g];
+      let bestTitleOccurrences = 0;
+      let bestContentOccurrences = 0;
+
+      for (let t = 0; t < group.length; t += 1) {
+        const kwLower = group[t];
+        if (!kwLower) {
+          continue;
+        }
+
+        const titleOccurrences = countOccurrences(item.titleLower, kwLower);
+        if (titleOccurrences > bestTitleOccurrences) {
+          bestTitleOccurrences = titleOccurrences;
+        }
+
+        if (!isTitleOnly) {
+          const contentOccurrences = countOccurrences(
+            item.contentLower,
+            kwLower
+          );
+          if (contentOccurrences > bestContentOccurrences) {
+            bestContentOccurrences = contentOccurrences;
+          }
+        }
       }
 
-      if (!isTitleOnly) {
-        const contentOccurrences = countOccurrences(
-          item.contentLower,
-          kwLower
-        );
-        if (contentOccurrences > 0) {
-          matched = true;
-          contentHits += contentOccurrences;
-          contentRank *= contentOccurrences + 1;
-        }
+      const keywordMatched = isTitleOnly
+        ? bestTitleOccurrences > 0
+        : bestTitleOccurrences > 0 || bestContentOccurrences > 0;
+
+      if (!keywordMatched) {
+        matchedAllKeywords = false;
+        break;
+      }
+
+      if (bestTitleOccurrences > 0) {
+        titleRank *= bestTitleOccurrences + 1;
+      }
+      if (!isTitleOnly && bestContentOccurrences > 0) {
+        contentRank *= bestContentOccurrences + 1;
       }
     }
 
-    if (!matched) {
+    if (!matchedAllKeywords) {
       continue;
     }
 
+    const groupCount = keywordGroupsLower.length || 1;
     const totalRank =
-      Math.round(Math.pow(titleRank, 1 / keywordsLower.length) * 20) +
+      Math.round(Math.pow(titleRank, 1 / groupCount) * 20) +
       (isTitleOnly
         ? 0
-        : Math.round(Math.pow(contentRank, 1 / keywordsLower.length)));
+        : Math.round(Math.pow(contentRank, 1 / groupCount)));
 
     const sourcePath = extractSourcePath(item.path);
     const displayTitle = buildDisplayTitle(item.title, sourcePath);
-    const preview = buildPreview(item.content, keywords);
+    const preview = buildPreview(item.content, previewKeywords);
 
     results.push({
       index,
@@ -423,6 +520,7 @@ app.get("/api/search", (req, res) => {
       rank: totalRank,
       preview,
       content: item.content,
+      category: item.category,
     });
   }
 
@@ -436,6 +534,18 @@ app.get("/api/search", (req, res) => {
   setCachedResults(cacheKey, results);
 
   res.json(paginateResults(results, pageNum, size));
+});
+
+// 获取过滤选项
+app.get("/api/filters", (req, res) => {
+  const sortedCategories = Array.from(categories);
+  sortedCategories.sort((a, b) =>
+    a.localeCompare(b, "zh-Hans", { sensitivity: "base" })
+  );
+  res.json({
+    categories: sortedCategories,
+    defaultCategory: DEFAULT_CATEGORY,
+  });
 });
 
 // 获取内容详情
