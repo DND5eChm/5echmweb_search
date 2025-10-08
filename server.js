@@ -5,6 +5,7 @@ const cors = require("cors");
 const vm = require("vm");
 
 const MIN_TOKEN_LENGTH = 2;
+const ASCII_TOKEN_REGEX = /^[a-z0-9]+$/;
 const CACHE_MAX_ENTRIES = 120;
 const CACHE_TTL = 5 * 60 * 1000;
 const PREVIEW_MAX_LENGTH = 600;
@@ -218,6 +219,9 @@ function collectCandidateIndexes(keywordsLower, baseIndexesSet) {
 
   for (const keyword of keywordsLower) {
     if (keyword.length < MIN_TOKEN_LENGTH) {
+      continue;
+    }
+    if (!ASCII_TOKEN_REGEX.test(keyword)) {
       continue;
     }
     const bucket = tokenIndex.get(keyword);
