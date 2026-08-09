@@ -33,3 +33,44 @@ Windows 可双击 `start.cmd` 启动；首次运行前执行 `npm install`。
 
 GitHub Webhook 使用 `POST /webhook`，保留 GitHub 标准请求头（`x-github-event`、
 `x-github-delivery`、`x-hub-signature-256`）。收到请求后立即执行 SHA 检查与更新。
+
+## GitHub Webhook 配置
+
+1. 确保服务已启动，并通过公网域名、反向代理或内网穿透暴露服务。GitHub 无法访问 `localhost`。
+
+   默认回调地址：
+
+   ```text
+   https://你的域名/webhook
+   ```
+
+   反向代理目标：
+
+   ```text
+   http://127.0.0.1:13000/webhook
+   ```
+
+2. 设置 Webhook 密钥。Windows 可在 `start.cmd` 的 `call npm start` 前加入：
+
+   ```cmd
+   set GITHUB_WEBHOOK_SECRET=替换为随机密钥
+   call npm start
+   ```
+
+   也可通过系统环境变量 `GITHUB_WEBHOOK_SECRET` 设置。密钥不要提交到 Git 仓库。
+
+3. 打开 GitHub 仓库：`Settings` → `Webhooks` → `Add webhook`。
+
+4. 填写表单：
+
+   - `Payload URL`：填写 `https://你的域名/webhook`。
+   - `Content type`：选择 `application/json`。
+   - `Secret`：填写与 `GITHUB_WEBHOOK_SECRET` 完全相同的密钥。
+   - `Which events would you like to receive?`：选择 `Just the push event`。
+   - `Active`：保持勾选。
+
+5. 点击 `Add webhook`。GitHub 推送代码后，服务会校验签名、获取远程 `data.js` SHA，并在索引变化时自动下载和重载。
+
+6. 可在 Webhook 详情页的 `Recent Deliveries` 中查看请求。成功响应为 HTTP `200`，失败请求会显示错误响应并可使用 `Redeliver` 重试。
+
+未配置 `GITHUB_WEBHOOK_SECRET` 时仍会接收请求，但不会校验签名，不建议用于公网服务。
