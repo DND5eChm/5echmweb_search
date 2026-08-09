@@ -3,6 +3,9 @@ const fs = require("fs");
 const path = require("path");
 const cors = require("cors");
 const vm = require("vm");
+const crypto = require("crypto");
+const config = require("./config");
+const { createDataUpdater } = require("./data-updater");
 
 const MIN_TOKEN_LENGTH = 2;
 const ASCII_TOKEN_REGEX = /^[a-z0-9]+$/;
@@ -11,6 +14,7 @@ const CACHE_TTL = 5 * 60 * 1000;
 const PREVIEW_MAX_LENGTH = 600;
 const MAX_PAGE_SIZE = 100;
 const DEFAULT_CATEGORY = "未分类";
+const DATA_JS_PATH = config.dataPath || path.join(__dirname, "data.js");
 
 let searchData = [];
 let tokenIndex = new Map();
@@ -18,21 +22,30 @@ const queryCache = new Map();
 let categories = new Set();
 
 const app = express();
-const PORT = process.env.PORT ? parseInt(process.env.PORT, 10) : 13000;
+const PORT = config.port;
 
 // 中间件
 app.use(cors());
-app.use(express.json());
+app.use(
+  express.json({
+    limit: "10mb",
+    verify: (request, response, body) => {
+      request.rawBody = Buffer.from(body);
+    },
+  })
+);
+app.use((request, response, next) => {
+  if (request.path === "/config.js" || request.path === "/data-updater.js") {
+    return response.sendStatus(404);
+  }
+  return next();
+});
 app.use(express.static(__dirname));
 
 // 加载并解析 data.js
 function loadSearchData() {
   try {
-    resetInMemoryStructures();
-    categories.add(DEFAULT_CATEGORY);
-
-    const dataPath = path.join(__dirname, "data.js");
-    const content = fs.readFileSync(dataPath, "utf-8");
+    const content = fs.readFileSync(DATA_JS_PATH, "utf-8");
 
     const sandbox = {};
     vm.createContext(sandbox);
@@ -40,6 +53,10 @@ function loadSearchData() {
       filename: "data.js",
     });
     const rawContents = script.runInContext(sandbox, { timeout: 5000 });
+
+    const nextSearchData = [];
+    const nextTokenIndex = new Map();
+    const nextCategories = new Set([DEFAULT_CATEGORY]);
 
     if (Array.isArray(rawContents)) {
       for (let i = 0; i < rawContents.length; i += 3) {
@@ -62,33 +79,41 @@ function loadSearchData() {
             category,
           };
 
-          const docIndex = searchData.length;
-          searchData.push(record);
-          indexDocumentTokens(docIndex, record.titleLower, record.contentLower);
-          categories.add(category);
+          const docIndex = nextSearchData.length;
+          nextSearchData.push(record);
+          indexDocumentTokens(
+            docIndex,
+            record.titleLower,
+            record.contentLower,
+            nextTokenIndex
+          );
+          nextCategories.add(category);
         }
       }
     }
+    searchData = nextSearchData;
+    tokenIndex = nextTokenIndex;
+    categories = nextCategories;
+    queryCache.clear();
     console.log(`已加载 ${searchData.length} 条数据`);
+    return true;
   } catch (error) {
-    console.error("加载数据失败:", error);
+    if (error.code === "ENOENT") {
+      console.warn("本地 data.js 不存在，启动时自动下载");
+    } else {
+      console.error("加载数据失败:", error);
+    }
+    return false;
   }
 }
 
-function resetInMemoryStructures() {
-  searchData = [];
-  tokenIndex = new Map();
-  queryCache.clear();
-  categories = new Set();
-}
-
-function indexDocumentTokens(docIndex, titleLower, contentLower) {
+function indexDocumentTokens(docIndex, titleLower, contentLower, targetIndex = tokenIndex) {
   const tokens = extractTokens(`${titleLower} ${contentLower}`);
   tokens.forEach((token) => {
-    let bucket = tokenIndex.get(token);
+    let bucket = targetIndex.get(token);
     if (!bucket) {
       bucket = new Set();
-      tokenIndex.set(token, bucket);
+      targetIndex.set(token, bucket);
     }
     bucket.add(docIndex);
   });
@@ -559,9 +584,72 @@ app.get("/api/content/:index", (req, res) => {
   res.status(404).json({ error: "内容未找到" });
 });
 
-// 启动服务器前加载数据
-loadSearchData();
+function verifyGithubWebhookSignature(request) {
+  if (!config.webhookSecret) {
+    return true;
+  }
+  const signature = request.get("x-hub-signature-256") || "";
+  const expected = `sha256=${crypto
+    .createHmac("sha256", config.webhookSecret)
+    .update(request.rawBody || Buffer.alloc(0))
+    .digest("hex")}`;
+  const actualBuffer = Buffer.from(signature, "utf8");
+  const expectedBuffer = Buffer.from(expected, "utf8");
+  return (
+    actualBuffer.length === expectedBuffer.length &&
+    crypto.timingSafeEqual(actualBuffer, expectedBuffer)
+  );
+}
 
-app.listen(PORT, () => {
-  console.log(`服务器运行在 http://localhost:${PORT}`);
+const dataUpdater = createDataUpdater({
+  dataPath: DATA_JS_PATH,
+  githubFileUrl: config.githubFileUrl,
+  githubApiUrl: config.githubApiUrl,
+  downloadUrl: config.downloadUrl,
+  githubToken: config.githubToken,
+  updateIntervalMs: config.updateIntervalMs,
+  reload: loadSearchData,
 });
+
+// GitHub Webhook 标准入口。收到事件后立即执行 SHA 检查与更新。
+app.post(config.webhookPath, async (req, res) => {
+  if (!verifyGithubWebhookSignature(req)) {
+    return res.status(401).json({ error: "Webhook 签名无效" });
+  }
+
+  const event = req.get("x-github-event") || "unknown";
+  try {
+    const result = await dataUpdater.checkForUpdate("webhook");
+    return res.status(200).json({
+      ok: true,
+      event,
+      delivery: req.get("x-github-delivery") || "",
+      updated: Boolean(result && result.updated),
+    });
+  } catch (error) {
+    console.error(`Webhook 更新 data.js 失败: ${error.message}`);
+    return res.status(500).json({ ok: false, error: "data.js 更新失败" });
+  }
+});
+
+function startServer() {
+  app.listen(PORT, () => {
+    console.log(`服务器运行在 http://localhost:${PORT}`);
+  });
+}
+
+// 本地索引缺失时，先完成首次下载尝试，再启动服务，避免空索引运行。
+const initialLoadSucceeded = loadSearchData();
+const initialUpdate = Promise.resolve().then(() => dataUpdater.start());
+if (initialLoadSucceeded) {
+  initialUpdate.catch((error) =>
+    console.error(`启动时更新 data.js 失败: ${error.message}`)
+  );
+  startServer();
+} else {
+  initialUpdate
+    .catch((error) =>
+      console.error(`启动时更新 data.js 失败: ${error.message}`)
+    )
+    .finally(startServer);
+}
